@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import time
 import subprocess
 import requests
+from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
 
 # 从环境变量获取账号密码和 TG 配置
@@ -15,8 +17,77 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可
 
 BASE_URL = "https://dashboard.katabump.com"  # 网站链接
 
+# ---------- 到期时间提取 ----------
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+def _normalize_expiry(raw: str) -> str:
+    """把各种日期写法统一成 YYYY/MM/DD，认不出来就返回空串"""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", raw)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+    m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw)
+    if m:
+        return f"{m.group(3)}/{int(m.group(2)):02d}/{int(m.group(1)):02d}"
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", raw)
+    if m and m.group(2).lower()[:3] in _MONTHS:
+        return f"{m.group(3)}/{_MONTHS[m.group(2).lower()[:3]]:02d}/{int(m.group(1)):02d}"
+    m = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})", raw)
+    if m and m.group(1).lower()[:3] in _MONTHS:
+        return f"{m.group(3)}/{_MONTHS[m.group(1).lower()[:3]]:02d}/{int(m.group(2)):02d}"
+    return ""
+
+def _extract_expiry_date(page_text: str) -> str:
+    """从页面文本里找到期日期，找不到返回空串"""
+    if not page_text:
+        return ""
+    # 优先：Expires / Expiry / Renewal / Due / Valid until 后面跟的日期
+    patterns = [
+        # 截图里就是这种写法：Expiry 在一行，2026-11-20 在下一行，
+        # 所以中间要用 [\s\S] 才能跨换行（. 跨不过换行）
+        r"(?:expires?|expiry|renewal|due date|valid until|next renewal|renewed until)[\s\S]{0,80}?"
+        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})",
+        # Expires in X days -> 今天 + X 天
+        r"expires?\s+in\s+(\d+)\s+days?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, page_text, re.I)
+        if not m:
+            continue
+        if "in" in pat and "days" in pat:
+            days = int(m.group(1))
+            now = datetime.now(timezone(timedelta(hours=8)))
+            return (now + timedelta(days=days)).strftime("%Y/%m/%d")
+        norm = _normalize_expiry(m.group(1))
+        if norm:
+            return norm
+    return ""
+
+def _get_expiry_from_page(sb) -> str:
+    """从当前页面读到期时间，读不到返回空串"""
+    try:
+        text = sb.get_page_text() or ""
+    except Exception:
+        text = ""
+    expiry = _extract_expiry_date(text)
+    if expiry:
+        return expiry
+    try:
+        expiry = _extract_expiry_date(sb.get_page_source() or "")
+    except Exception:
+        pass
+    return expiry or ""
+
+def _expiry_plus_4_days() -> str:
+    """续期成功但页面没给新日期时，按 Katabump 规则推算：续期当天 + 4 天"""
+    now = datetime.now(timezone(timedelta(hours=8)))
+    return (now + timedelta(days=4)).strftime("%Y/%m/%d")
+
 #  Telegram 推送模块
-def send_tg_message(status_icon, status_text, time_left=""):
+def send_tg_message(status_icon, status_text, time_left="", expiry_date=""):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
         return
@@ -35,12 +106,19 @@ def send_tg_message(status_icon, status_text, time_left=""):
     else:
         masked_email = EMAIL[:2] + '****'
 
-    text = (
-        f"🇫🇷 katabump 续期通知\n\n"
-        f"{status_icon} {status_text}\n"
-        f"👤 续期账户: {masked_email}\n"
-        f"⏱️ 续期时间: {current_time_str}"
-    )
+    # 和 bot-hosting 通知一样的格式，多一行 📅 到期时间
+    lines = [
+        "🇫🇷 katabump 续期通知",
+        "",
+        f"{status_icon} {status_text}",
+        f"👤 续期账户: {masked_email}",
+    ]
+    if expiry_date:
+        lines.append(f"📅 到期时间: {expiry_date}")
+    if time_left:
+        lines.append(time_left)
+    lines.append(f"⏱️ 续期时间: {current_time_str}")
+    text = "\n".join(lines)
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
@@ -354,7 +432,10 @@ def _goto_server_detail(sb) -> bool:
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
+        expiry = _get_expiry_from_page(sb)
+        if expiry:
+            print(f"📅 当前到期时间: {expiry}")
+        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text, expiry_date=expiry)
         return False
 
     # 多种选择器尝试查找 See 链接
@@ -572,18 +653,26 @@ def _check_renew_result(sb):
         time.sleep(3)
         alert_text = _read_alert(sb)
 
+    # 先从页面读到期时间，续期成功但页面没给时按 +4 天推算
+    expiry = _get_expiry_from_page(sb)
+    if expiry:
+        print(f"📅 到期时间: {expiry}")
+
     if alert_text:
         print(f"📩 页面提示: {alert_text}")
         low = alert_text.lower()
         if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
+            send_tg_message("⏳", "未到续期时间", alert_text, expiry_date=expiry)
         elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text)
+            if not expiry:
+                expiry = _expiry_plus_4_days()
+                print(f"📅 页面没给新日期，按续期当天 +4 天推算: {expiry}")
+            send_tg_message("✅", "续期成功", "到期日期已更新", expiry_date=expiry)
         else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text)
+            send_tg_message("ℹ️", "续期操作已执行", alert_text, expiry_date=expiry)
     else:
         print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示", expiry_date=expiry)
 
 
 def renew_server(sb):
